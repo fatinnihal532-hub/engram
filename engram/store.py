@@ -1,7 +1,8 @@
-"""SQLite-backed memory store with BM25 retrieval that learns from use.
+"""SQLite-backed memory store with hybrid retrieval that learns from use.
 
-Every memory carries a use count and a last-used timestamp. Memories that keep
-getting recalled rank higher; memories nobody asks for decay and are pruned first.
+Retrieval blends BM25 keyword relevance with vector similarity. Every memory also carries
+a use count and a last-used timestamp: memories that keep getting recalled rank higher;
+memories nobody asks for decay and are pruned first.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+from .embed import Embedder, HashEmbedder, cosine, from_blob, normalize, to_blob
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
@@ -26,6 +29,12 @@ B = 0.75
 
 HALF_LIFE_DAYS = 30.0
 DUPLICATE_THRESHOLD = 0.8
+
+MODES = ("hybrid", "bm25", "vector")
+# In hybrid mode, the share of the relevance score that comes from keyword matching.
+KEYWORD_WEIGHT = 0.5
+# Vector matches weaker than this are treated as unrelated.
+MIN_SIMILARITY = 0.25
 
 
 def _stem(token: str) -> str:
@@ -57,9 +66,13 @@ class Hit:
     score: float
 
 
+_COLUMNS = "id, text, kind, importance, uses, created_at, last_used"
+
+
 class MemoryStore:
-    def __init__(self, path: str | Path = "engram.db"):
-        self.db = sqlite3.connect(str(path))
+    def __init__(self, path: str | Path = "engram.db", embedder: Embedder | None = None):
+        self.embedder = embedder or HashEmbedder()
+        self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS memories (
@@ -69,16 +82,21 @@ class MemoryStore:
                 importance REAL NOT NULL DEFAULT 1.0,
                 uses INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
-                last_used REAL NOT NULL
+                last_used REAL NOT NULL,
+                embedding BLOB
             )"""
         )
+        # Databases created before vector search have no embedding column.
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(memories)")}
+        if "embedding" not in columns:
+            self.db.execute("ALTER TABLE memories ADD COLUMN embedding BLOB")
         self.db.commit()
 
     def close(self) -> None:
         self.db.close()
 
     def all(self) -> list[Memory]:
-        rows = self.db.execute("SELECT * FROM memories ORDER BY id").fetchall()
+        rows = self.db.execute(f"SELECT {_COLUMNS} FROM memories ORDER BY id").fetchall()
         return [Memory(**dict(r)) for r in rows]
 
     def add(self, text: str, kind: str = "fact", importance: float = 1.0,
@@ -98,15 +116,16 @@ class MemoryStore:
                 return self.get(existing.id)
 
         cur = self.db.execute(
-            "INSERT INTO memories (text, kind, importance, created_at, last_used) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (text, kind, importance, now, now),
+            "INSERT INTO memories (text, kind, importance, created_at, last_used, embedding) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (text, kind, importance, now, now, to_blob(self._embed(text))),
         )
         self.db.commit()
         return self.get(cur.lastrowid)
 
     def get(self, memory_id: int) -> Memory:
-        row = self.db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        row = self.db.execute(f"SELECT {_COLUMNS} FROM memories WHERE id = ?",
+                              (memory_id,)).fetchone()
         if row is None:
             raise KeyError(memory_id)
         return Memory(**dict(row))
@@ -117,33 +136,29 @@ class MemoryStore:
         return cur.rowcount > 0
 
     def search(self, query: str, k: int = 5, reinforce: bool = True,
-               now: float | None = None) -> list[Hit]:
-        """Rank memories by BM25 relevance, boosted by use count, recency and importance."""
+               now: float | None = None, mode: str = "hybrid") -> list[Hit]:
+        """Rank memories by relevance, boosted by use count, recency and importance.
+
+        `mode` picks the relevance signal: "bm25" (keywords), "vector" (embedding
+        similarity) or "hybrid" (both, each scaled to its best match and averaged).
+        """
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
         now = time.time() if now is None else now
         memories = self.all()
-        terms = tokenize(query)
-        if not memories or not terms:
+        if not memories or not query.strip():
             return []
 
-        docs = [tokenize(m.text) for m in memories]
-        avg_len = sum(len(d) for d in docs) / len(docs)
-        doc_freq = Counter(t for d in docs for t in set(d))
-        n = len(docs)
+        keyword = self._bm25(query, memories) if mode != "vector" else {}
+        vector = self._similarity(query, memories) if mode != "bm25" else {}
+        if mode == "hybrid":
+            relevance = _blend(keyword, vector, KEYWORD_WEIGHT)
+        else:
+            relevance = keyword or vector
 
-        hits = []
-        for memory, doc in zip(memories, docs):
-            counts = Counter(doc)
-            relevance = 0.0
-            for term in terms:
-                tf = counts.get(term, 0)
-                if not tf:
-                    continue
-                idf = math.log(1 + (n - doc_freq[term] + 0.5) / (doc_freq[term] + 0.5))
-                norm = tf + K1 * (1 - B + B * len(doc) / (avg_len or 1))
-                relevance += idf * tf * (K1 + 1) / norm
-            if relevance > 0:
-                hits.append(Hit(memory, relevance * self._strength(memory, now)))
-
+        by_id = {m.id: m for m in memories}
+        hits = [Hit(by_id[i], score * self._strength(by_id[i], now))
+                for i, score in relevance.items()]
         hits.sort(key=lambda h: h.score, reverse=True)
         hits = hits[:k]
         if reinforce and hits:
@@ -159,6 +174,47 @@ class MemoryStore:
         self.db.commit()
         return len(doomed)
 
+    def _bm25(self, query: str, memories: list[Memory]) -> dict[int, float]:
+        terms = tokenize(query)
+        docs = [tokenize(m.text) for m in memories]
+        avg_len = sum(len(d) for d in docs) / len(docs)
+        doc_freq = Counter(t for d in docs for t in set(d))
+        n = len(docs)
+
+        scores = {}
+        for memory, doc in zip(memories, docs):
+            counts = Counter(doc)
+            score = 0.0
+            for term in terms:
+                tf = counts.get(term, 0)
+                if not tf:
+                    continue
+                idf = math.log(1 + (n - doc_freq[term] + 0.5) / (doc_freq[term] + 0.5))
+                norm = tf + K1 * (1 - B + B * len(doc) / (avg_len or 1))
+                score += idf * tf * (K1 + 1) / norm
+            if score > 0:
+                scores[memory.id] = score
+        return scores
+
+    def _similarity(self, query: str, memories: list[Memory]) -> dict[int, float]:
+        target = self._embed(query)
+        rows = self.db.execute("SELECT id, text, embedding FROM memories").fetchall()
+        scores = {}
+        for row in rows:
+            blob = row["embedding"]
+            if blob is None:
+                # Row written before vector search existed: embed it now and keep the result.
+                blob = to_blob(self._embed(row["text"]))
+                self.db.execute("UPDATE memories SET embedding = ? WHERE id = ?", (blob, row["id"]))
+            similarity = cosine(target, from_blob(blob))
+            if similarity >= MIN_SIMILARITY:
+                scores[row["id"]] = similarity
+        self.db.commit()
+        return scores
+
+    def _embed(self, text: str):
+        return normalize(self.embedder(text))
+
     @staticmethod
     def _strength(memory: Memory, now: float) -> float:
         age_days = max(0.0, now - memory.last_used) / 86400
@@ -171,3 +227,13 @@ class MemoryStore:
             [(now, i) for i in ids],
         )
         self.db.commit()
+
+
+def _blend(keyword: dict[int, float], vector: dict[int, float], weight: float) -> dict[int, float]:
+    """Scale each signal to its best match, then take a weighted average."""
+    top_keyword = max(keyword.values(), default=0.0) or 1.0
+    top_vector = max(vector.values(), default=0.0) or 1.0
+    return {
+        i: weight * keyword.get(i, 0.0) / top_keyword + (1 - weight) * vector.get(i, 0.0) / top_vector
+        for i in keyword.keys() | vector.keys()
+    }

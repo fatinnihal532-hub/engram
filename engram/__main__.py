@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .store import MemoryStore
+from .store import MODES, MemoryStore
 
 
 def cmd_chat(store: MemoryStore, _args: argparse.Namespace) -> int:
@@ -46,7 +46,7 @@ def cmd_add(store: MemoryStore, args: argparse.Namespace) -> int:
 
 
 def cmd_search(store: MemoryStore, args: argparse.Namespace) -> int:
-    hits = store.search(args.query, k=args.limit, reinforce=not args.peek)
+    hits = store.search(args.query, k=args.limit, reinforce=not args.peek, mode=args.mode)
     for hit in hits:
         print(f"{hit.score:6.2f}  #{hit.memory.id} [{hit.memory.kind}] {hit.memory.text}")
     if not hits:
@@ -89,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("search", help="search memories")
     p.add_argument("query")
     p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--mode", choices=MODES, default="hybrid")
     p.add_argument("--peek", action="store_true", help="do not reinforce the results")
     p.set_defaults(fn=cmd_search)
 
