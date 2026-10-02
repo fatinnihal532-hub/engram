@@ -1,5 +1,7 @@
 # engram
 
+[![tests](https://github.com/fatinnihal532-hub/engram/actions/workflows/tests.yml/badge.svg)](https://github.com/fatinnihal532-hub/engram/actions/workflows/tests.yml)
+
 Long-term memory for LLM agents that gets better the more it is used.
 
 Most agent memory is a pile of notes with a search box. `engram` tracks how often each
